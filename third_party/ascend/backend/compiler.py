@@ -107,8 +107,10 @@ def make_ttir(mod, metadata, opt):
     if "hash" not in metadata:
         metadata["hash"] = hashlib.sha256(f"{mod}-{metadata}".encode()).hexdigest()
     # the same optimize pass for triton-ir as all other backends
+    ascend.disable_multithreading(mod.context)
     pm = ir.pass_manager(mod.context)
-    pm.enable_debug()
+    if os.environ.get("TRITON_ASCEND_DEBUG") == "1":
+        ascend.passes.ttir.enable_ir_printing(pm)
     passes.common.add_inliner(pm)
     passes.ttir.add_combine(pm)
     passes.common.add_canonicalizer(pm)
@@ -162,7 +164,9 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         if has_auto_blockify_blacklist_op or not auto_map_parallel_blocks_enabled:
             auto_blockify_size = 1
         pm = ir.pass_manager(mod.context)
-        pm.enable_debug()
+        if os.environ.get("TRITON_ASCEND_DEBUG") == "1":
+            ascend.passes.ttir.enable_ir_printing(pm)
+        ascend.disable_multithreading(mod.context)
         ascend.passes.ttir.add_auto_blockify(
             pm,
             auto_blockify_size

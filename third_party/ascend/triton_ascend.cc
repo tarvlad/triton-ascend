@@ -9,6 +9,8 @@
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 #include "mlir/Pass/PassManager.h"
 
+#include "llvm/Support/raw_ostream.h"
+
 #include "ascend/include/AutoBlockify/Passes.h"
 #include "ascend/include/TritonToStructured/Passes.h"
 #include "ascend/include/TritonToAnnotation/Passes.h"
@@ -302,6 +304,17 @@ void init_triton_ascend_ir(py::module &&m) {
 }
 
 void init_triton_ascend_passes_ttir(py::module &&m) {
+  m.def("enable_ir_printing", [](mlir::PassManager &pm) {
+    pm.enableIRPrinting(
+        [](mlir::Pass *, mlir::Operation *) { return true; },
+        [](mlir::Pass *, mlir::Operation *) { return true; },
+        /*printModuleScope=*/true,
+        /*printAfterOnlyOnChange=*/false,
+        /*printAfterOnlyOnFailure=*/false,
+        llvm::outs(),
+        mlir::OpPrintingFlags());
+  });
+
   m.def("add_auto_blockify", [](mlir::PassManager &pm,
     int autoBlockifySize) {
     AutoBlockifyOptions opts;
@@ -395,6 +408,10 @@ void init_triton_ascend(py::module &&m) {
     registry.insert<mlir::triton::ascend::TritonAscendDialect>();
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
+  });
+
+  m.def("disable_multithreading", [](mlir::MLIRContext &context) {
+    context.disableMultithreading();
   });
 
   init_triton_ascend_passes_ttir(passes.def_submodule("ttir"));
