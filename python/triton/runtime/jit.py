@@ -321,6 +321,136 @@ def mangle_type(arg, is_const=False):
         return res
 
 
+def _jsonable_compile_value(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_compile_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): _jsonable_compile_value(item)
+            for key, item in value.items()
+        }
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return _jsonable_compile_value(item())
+        except Exception:
+            pass
+    text = repr(value)
+    return text if len(text) <= 120 else text[:117] + "..."
+
+
+def _jsonable_compile_sequence(value):
+    if value is None:
+        return None
+    try:
+        items = list(value)
+    except TypeError:
+        return None
+    return [_jsonable_compile_value(item) for item in items]
+
+
+def _compile_arg_shape(value):
+    try:
+        shape = getattr(value, "shape")
+    except Exception:
+        return None
+    return _jsonable_compile_sequence(shape)
+
+
+def _compile_arg_stride(value, rank):
+    try:
+        stride = getattr(value, "stride", None)
+    except Exception:
+        return None
+    if callable(stride):
+        try:
+            return _jsonable_compile_sequence(stride())
+        except TypeError:
+            if rank is None:
+                return None
+            try:
+                return [_jsonable_compile_value(stride(i)) for i in range(rank)]
+            except Exception:
+                return None
+        except Exception:
+            return None
+    try:
+        strides = getattr(value, "strides", None)
+    except Exception:
+        strides = None
+    return _jsonable_compile_sequence(stride if stride is not None else strides)
+
+
+def _format_compile_shape(shape):
+    if not shape:
+        return "scalar"
+    return "x".join(str(dim) for dim in shape)
+
+
+def _format_compile_sequence(values):
+    return "(" + ",".join(str(value) for value in values) + ")"
+
+
+def _format_compile_arg(param):
+    text = param["name"]
+    ty = param.get("type")
+    if ty:
+        text += f":{ty}"
+    shape = param.get("shape")
+    if isinstance(shape, list):
+        text += f"[{_format_compile_shape(shape)}]"
+        stride = param.get("stride")
+        if isinstance(stride, list):
+            text += f" stride={_format_compile_sequence(stride)}"
+    elif isinstance(ty, str) and ty.startswith("*"):
+        text += "[?]"
+    if "value" in param:
+        text += f"={param['value']!r}"
+    return text
+
+
+def _collect_compile_launch_metadata(name, params, signature, bound_args):
+    rendered_params = []
+    structured_params = []
+    for param in params:
+        arg_name = param.name
+        value = bound_args[arg_name]
+        arg_type = signature.get(arg_name)
+        if arg_type is None and param.is_constexpr:
+            arg_type = "constexpr"
+
+        item = {"name": arg_name}
+        if arg_type is not None:
+            item["type"] = arg_type
+
+        try:
+            dtype = getattr(value, "dtype", None)
+        except Exception:
+            dtype = None
+        if dtype is not None:
+            item["dtype"] = str(dtype)
+
+        shape = _compile_arg_shape(value)
+        if shape is not None:
+            item["shape"] = shape
+            stride = _compile_arg_stride(value, len(shape))
+            if stride is not None:
+                item["stride"] = stride
+        elif dtype is None or arg_type == "constexpr":
+            item["value"] = _jsonable_compile_value(value)
+
+        structured_params.append(item)
+        rendered_params.append(_format_compile_arg(item))
+
+    return {
+        "name": name,
+        "parameters": structured_params,
+        "kernel_signature": f"{name}({', '.join(rendered_params)})",
+    }
+
+
 class KernelInterface(Generic[T]):
     run: T
 
@@ -619,7 +749,20 @@ class JITFunction(KernelInterface[T]):
                 if callable(arg):
                     raise TypeError(f"Callable constexpr at index {i} is not supported")
 
-            kernel = self._do_compile(key, signature, device, backend, target, constants, options, configs[0], warmup)
+            launch_metadata = _collect_compile_launch_metadata(self.fn.__name__, self.params, signature, bound_args)
+
+            kernel = self._do_compile(
+                key,
+                signature,
+                device,
+                backend,
+                target,
+                constants,
+                options,
+                configs[0],
+                warmup,
+                launch_metadata=launch_metadata,
+            )
             if kernel is None:
                 return None
 
@@ -761,12 +904,13 @@ class JITFunction(KernelInterface[T]):
             warmup=True,
         )
 
-    def _do_compile(self, key, signature, device, backend, target, constants, options, attrs, warmup):
+    def _do_compile(self, key, signature, device, backend, target, constants, options, attrs, warmup,
+                    launch_metadata=None):
         kernel_cache = self.cache[device]
 
         if self._call_hook(key, signature, device, constants, options, [attrs], warmup, before=True):
             return None
-        src = self.ASTSource(self, signature, constants, attrs)
+        src = self.ASTSource(self, signature, constants, attrs, launch_metadata=launch_metadata)
 
         async_mode = _async_compile.active_mode.get()
         if async_mode is not None:

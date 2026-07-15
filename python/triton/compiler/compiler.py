@@ -42,6 +42,8 @@ arg_type_pattern = {
     "ptx": ptx_arg_type_pattern,
 }
 
+_COMPILE_LAUNCH_METADATA_KEY = "_triton_compile_launch_metadata"
+
 
 def convert_type_repr(x):
     # Currently we only capture the pointer type and assume the pointer is on global memory.
@@ -68,13 +70,14 @@ def _get_num_warps_from_ir_str(src: str):
 
 class ASTSource:
 
-    def __init__(self, fn, signature, constants=None, attrs=None) -> None:
+    def __init__(self, fn, signature, constants=None, attrs=None, launch_metadata=None) -> None:
         self.fn = fn
         self.ext = "ttir"
         self.name = fn.__name__
         self.signature = signature
         self.constants = constants
         self.attrs = attrs
+        self.launch_metadata = launch_metadata
         if isinstance(self.signature, str):
             self.signature = {k: v.strip() for k, v in enumerate(self.signature.split(","))}
         else:
@@ -264,6 +267,8 @@ def compile(src, target=None, options=None, _env_vars=None):
         **options.__dict__,
         **env_vars,
     }
+    if isinstance(src, ASTSource) and src.launch_metadata is not None:
+        metadata[_COMPILE_LAUNCH_METADATA_KEY] = src.launch_metadata
     # run compilation pipeline  and populate metadata
     stages = dict()
     backend.add_stages(stages, options)
@@ -314,6 +319,7 @@ def compile(src, target=None, options=None, _env_vars=None):
             next_module.create_location_snapshot(ir_full_name)
             print(f"Creating new locations for {ir_full_name}")
         module = next_module
+    metadata.pop(_COMPILE_LAUNCH_METADATA_KEY, None)
     # write-back metadata
     metadata_group[metadata_filename] = fn_cache_manager.put(json.dumps(metadata, default=vars), metadata_filename,
                                                              binary=False)
