@@ -1,4 +1,4 @@
-﻿# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -29,6 +29,7 @@ import shlex
 import subprocess
 import tempfile
 import warnings
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -127,8 +128,66 @@ def _get_dump_paths(hash_key: str, src_path: str, dst_path: str) -> Tuple[str, s
     dump_manager = get_dump_manager(hash_key)
     return (dump_manager._make_path(os.path.basename(src_path)), dump_manager._make_path(os.path.basename(dst_path)))
 
+_COMPILE_TIMING_KEY = "_ascend_compile_timing"
+_COMPILE_LAUNCH_METADATA_KEY = "_triton_compile_launch_metadata"
+
+
+def _compile_timing_active(opt) -> bool:
+    return bool(getattr(opt, "debug", False))
+
+
+def _compile_stage_start(opt):
+    return time.perf_counter_ns() if _compile_timing_active(opt) else None
+
+
+def _compile_timing_state(metadata) -> Dict[str, Any]:
+    state = metadata.setdefault(_COMPILE_TIMING_KEY, {"stages_us": []})
+    launch_metadata = metadata.get(_COMPILE_LAUNCH_METADATA_KEY)
+    if isinstance(launch_metadata, dict):
+        signature = launch_metadata.get("kernel_signature")
+        if isinstance(signature, str) and signature:
+            state.setdefault("kernel_signature", signature)
+        params = launch_metadata.get("parameters")
+        name = launch_metadata.get("name")
+        if isinstance(name, str) and isinstance(params, list):
+            state.setdefault("signature", {"name": name, "parameters": params})
+    return state
+
+
+def _record_compile_stage(metadata, opt, stage_name: str, start_ns) -> None:
+    if not _compile_timing_active(opt) or start_ns is None:
+        return
+    duration_us = int(round((time.perf_counter_ns() - start_ns) / 1000))
+    _compile_timing_state(metadata)["stages_us"].append(
+        {"name": stage_name, "time_us": duration_us}
+    )
+
+
+def _write_compile_timing_event(metadata, opt) -> None:
+    if not _compile_timing_active(opt):
+        return
+    state = _compile_timing_state(metadata)
+    if not state:
+        return
+    signature = state.get("kernel_signature")
+    if not signature:
+        raise AssertionError("missing launch kernel signature for Ascend compile timing")
+    stages = state.get("stages_us") or []
+    if stages:
+        event = {
+            "kernel_signature": signature,
+            "stages_us": stages,
+        }
+        if isinstance(state.get("signature"), dict):
+            event["signature"] = state["signature"]
+        dump_manager = get_dump_manager(metadata["hash"])
+        event_path = Path(dump_manager.cache_dir) / "compile_times.ndjson"
+        with event_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, separators=(",", ":")) + "\n")
+    metadata.pop(_COMPILE_TIMING_KEY, None)
 
 def make_ttir(mod, metadata, opt):
+    stage_start_ns = _compile_stage_start(opt)
     if "hash" not in metadata:
         metadata["hash"] = hashlib.sha256(f"{mod}-{metadata}".encode()).hexdigest()
     # the same optimize pass for triton-ir as all other backends
@@ -146,14 +205,17 @@ def make_ttir(mod, metadata, opt):
     passes.ttir.add_loop_unroll(pm)
     pm.run(mod, 'make_ttir')
     if opt.debug:
+        ttir_text = str(mod)
         dump_manager = get_dump_manager(metadata["hash"])
         print(f"Dumping intermediate results to {dump_manager.cache_dir}")
-        dump_manager.put(str(mod), "kernel.ttir.mlir", binary=False)
+        dump_manager.put(ttir_text, "kernel.ttir.mlir", binary=False)
+    _record_compile_stage(metadata, opt, "ttir_optimize", stage_start_ns)
 
     return mod
 
 
 def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
+    stage_start_ns = _compile_stage_start(opt)
     # use triton_adapter to lower Triton-MLIR to linalg
     # Get Triton-MLIR as string
     ttir_code = str(mod)
@@ -266,6 +328,31 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         if opt.debug:
             dump_manager = get_dump_manager(metadata["hash"])
             dump_manager.put(str(mod), "kernel.ttadapter.mlir", binary=False)
+            _dump_stage_command(
+                metadata,
+                opt,
+                "ttir_to_ttadapter",
+                {
+                    "kind": "in_process",
+                    "callable": "ttir_to_linalg",
+                    "input": str(Path(dump_manager.cache_dir) / "kernel.ttir.mlir"),
+                    "output": str(Path(dump_manager.cache_dir) / "kernel.ttadapter.mlir"),
+                    "temporary_input": src_path,
+                    "temporary_output": dst_path,
+                    "named_ops": named_ops,
+                    "options": {
+                        "auto_blockify_size": auto_blockify_size,
+                        "enable_nd2nz_on_vector": enable_nd2nz_on_vector,
+                        "enable_select_analysis": enable_select_analysis,
+                        "compile_on_910_95": compile_on_910_95,
+                        "force_simt_template": force_simt_template,
+                        "enable_sync_block_lock": enable_sync_block_lock,
+                        "enable_mask_fallback_conversion": enable_mask_fallback_conversion,
+                        "optimize_dynamic_offset": optimize_dynamic_offset,
+                    },
+                },
+            )
+        _record_compile_stage(metadata, opt, "ttir_to_ttadapter", stage_start_ns)
 
         return str(mod)
 
@@ -464,6 +551,55 @@ def get_auto_bind_sub_block_option(metadata):
             if enable_auto_bind_sub_block is None else enable_auto_bind_sub_block)
 
 
+def _safe_command_stage_name(stage_name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", stage_name)
+
+
+def _dump_stage_command(metadata, opt, stage_name: str, command: Dict[str, Any]) -> None:
+    if not opt.debug:
+        return
+    dump_manager = get_dump_manager(metadata["hash"])
+    command = dict(command)
+    command.setdefault("stage", stage_name)
+    for argv_key, shell_key in (("argv", "shell"), ("replay_argv", "replay_shell")):
+        argv = command.get(argv_key)
+        if argv is not None and shell_key not in command:
+            command[shell_key] = shlex.join(str(arg) for arg in argv)
+    command_path = Path(dump_manager.cache_dir) / f"compile_command.{_safe_command_stage_name(stage_name)}.json"
+    command_path.write_text(json.dumps(command, indent=2) + "\n", encoding="utf-8")
+
+
+def _dump_external_stage_command(
+    metadata,
+    opt,
+    stage_name: str,
+    cmd_list,
+    tmpdir: str,
+    dump_path_replacements: Dict[str, str],
+) -> None:
+    if not opt.debug:
+        return
+    dump_manager = get_dump_manager(metadata["hash"])
+    dump_dir = Path(dump_manager.cache_dir)
+    path_replacements = {
+        runtime_path: str(dump_dir / dump_path)
+        for runtime_path, dump_path in dump_path_replacements.items()
+    }
+    replay_argv = [path_replacements.get(arg, arg) for arg in cmd_list]
+    _dump_stage_command(
+        metadata,
+        opt,
+        stage_name,
+        {
+            "kind": "external",
+            "cwd": tmpdir,
+            "argv": list(cmd_list),
+            "replay_cwd": dump_manager.cache_dir,
+            "replay_argv": replay_argv,
+        },
+    )
+
+
 def _save_npuir_debug_output(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: str, metadata_hash: str):
     stdout = stdout_bytes.decode('utf-8') if stdout_bytes else ''
     stderr = stderr_bytes.decode('utf-8') if stderr_bytes else ''
@@ -511,6 +647,7 @@ def try_compile_with_config(linalg: str, ub_config: Dict[str, Any], metadata: di
 
 
 def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
+    stage_start_ns = _compile_stage_start(opt)
     linalg, metadata = _parse_linalg_metadata(linalg, metadata)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_file_name = "kernel.mlir" if opt.use_bytecode else "kernel.ttadapter.mlir"
@@ -729,6 +866,17 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         plan_memory_strategy = metadata["plan_memory_strategy"]
         if plan_memory_strategy is not None:
             cmd_list += [f"--plan-memory-strategy={plan_memory_strategy}"]
+        _dump_external_stage_command(
+            metadata,
+            opt,
+            "ttadapter_to_npubin",
+            cmd_list,
+            tmpdir,
+            {
+                ttadapter_path: tmp_file_name,
+                bin_file: "replay.kernel",
+            },
+        )
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
             print_cmd_list = cmd_list.copy()
@@ -764,10 +912,14 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_num_function", metadata, "lock_num")
             __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_init_function", metadata, "lock_init_val")
 
-        return Path(bin_path).read_bytes()
+        binary = Path(bin_path).read_bytes()
+        _record_compile_stage(metadata, opt, "ttadapter_to_npubin", stage_start_ns)
+        _write_compile_timing_event(metadata, opt)
+        return binary
 
 
 def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
+    stage_start_ns = _compile_stage_start(opt)
     linalg, metadata = _parse_linalg_metadata(linalg, metadata)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_file_name = "kernel.mlir" if opt.use_bytecode else "kernel.ttadapter.mlir"
@@ -950,6 +1102,17 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
+        _dump_external_stage_command(
+            metadata,
+            opt,
+            "ttadapter_to_npubin",
+            cmd_list,
+            tmpdir,
+            {
+                ttadapter_path: tmp_file_name,
+                bin_file: "replay.kernel",
+            },
+        )
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
             print_cmd_list = cmd_list.copy()
@@ -984,7 +1147,10 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_num_function", metadata, "lock_num")
             __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_init_function", metadata, "lock_init_val")
 
-        return Path(bin_path).read_bytes()
+        binary = Path(bin_path).read_bytes()
+        _record_compile_stage(metadata, opt, "ttadapter_to_npubin", stage_start_ns)
+        _write_compile_timing_event(metadata, opt)
+        return binary
 
 
 def get_libdevice():
@@ -1142,6 +1308,7 @@ class NPUOptions:
 
 
 def ttir_to_npubin(mod, metadata, opt):
+    stage_start_ns = _compile_stage_start(opt)
     # Get Triton-MLIR as string
     ttir_code = str(mod)
     metadata = _parse_ttir_metadata(ttir_code, metadata)
@@ -1197,13 +1364,27 @@ def ttir_to_npubin(mod, metadata, opt):
 
         npu_compiler_path, env = _get_npucompiler_path()
         cmd_list = ([npu_compiler_path, src_path] + _compile_option_list + ["-o", bin_file])
+        _dump_external_stage_command(
+            metadata,
+            opt,
+            "ttir_to_npubin",
+            cmd_list,
+            tmpdir,
+            {
+                src_path: "kernel.ttir.mlir",
+                bin_file: "replay.kernel",
+            },
+        )
         ret = subprocess.run(cmd_list, env=env, capture_output=True, check=True)
         if not Path(bin_path).exists():
             error_msg = ret.stderr.decode('utf-8')
             print(f"[DEBUG] {bin_path} is not found")
             print(f"[DEBUG] Stderr:\n{error_msg}")
             raise subprocess.CalledProcessError(ret.returncode, cmd_list, ret.stdout, ret.stderr)
-        return Path(bin_path).read_bytes()
+        binary = Path(bin_path).read_bytes()
+        _record_compile_stage(metadata, opt, "ttir_to_npubin", stage_start_ns)
+        _write_compile_timing_event(metadata, opt)
+        return binary
 
 
 def get_simt_stack_limit():
