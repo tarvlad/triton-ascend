@@ -35,6 +35,8 @@ arg_type_pattern = {
     "ptx": ptx_arg_type_pattern,
 }
 
+_COMPILE_LAUNCH_METADATA_KEY = "_triton_compile_launch_metadata"
+
 
 def convert_type_repr(x):
     # Currently we only capture the pointer type and assume the pointer is on global memory.
@@ -51,7 +53,7 @@ def convert_type_repr(x):
 
 class ASTSource:
 
-    def __init__(self, fn, signature, constexprs=None, attrs=None) -> None:
+    def __init__(self, fn, signature, constants=None, attrs=None, launch_metadata=None) -> None:
         self.fn = fn
         self.language = Language.TRITON
         self.ext = "ttir"
@@ -64,6 +66,7 @@ class ASTSource:
                 assert isinstance(k, tuple)
                 self.constants[k] = v
         self.attrs = attrs or dict()
+        self.launch_metadata = launch_metadata
         for k in self.signature.keys():
             if not isinstance(k, str):
                 raise TypeError("Signature keys must be string")
@@ -283,6 +286,8 @@ def compile(src, target=None, options=None, _env_vars=None):
         **env_vars,
     }
     metadata["triton_version"] = __version__
+    if isinstance(src, ASTSource) and src.launch_metadata is not None:
+        metadata[_COMPILE_LAUNCH_METADATA_KEY] = src.launch_metadata
     # run compilation pipeline  and populate metadata
     stages = dict()
     backend.add_stages(stages, options, src.language)
@@ -347,6 +352,7 @@ def compile(src, target=None, options=None, _env_vars=None):
         module = next_module
         if compilation_listener:
             timer.stage_finished(ext)
+    metadata.pop(_COMPILE_LAUNCH_METADATA_KEY, None)
     # write-back metadata
     metadata_group[metadata_filename] = fn_cache_manager.put(json.dumps(metadata, default=vars), metadata_filename,
                                                              binary=False)
