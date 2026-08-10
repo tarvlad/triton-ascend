@@ -117,7 +117,7 @@ def classify_arrays(
     hivmc_arr: list[dict[str, Any]] | None = None
     for arr in arrays:
         names = top_level_names(arr)
-        if "hivmc-a5" in names:
+        if "hivmc-a5" in names or "hivmc" in names:
             npuir_arr = arr
         if "bisheng" in names and "ld.lld" in names:
             hivmc_arr = arr
